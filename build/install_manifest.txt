@@ -1,0 +1,10 @@
+/usr/local/lib/libw2xc.so
+/usr/local/bin/waifu2x-converter-cpp
+/usr/local/share/waifu2x-converter-cpp/noise0_model.json
+/usr/local/share/waifu2x-converter-cpp/noise1_model.json
+/usr/local/share/waifu2x-converter-cpp/noise2_model.json
+/usr/local/share/waifu2x-converter-cpp/noise3_model.json
+/usr/local/share/waifu2x-converter-cpp/scale2.0x_model.json
+/usr/local/share/waifu2x-converter-cpp/noise1_model.json.bin
+/usr/local/share/waifu2x-converter-cpp/scale2.0x_model.json.bin
+/usr/local/include/w2xconv.h
