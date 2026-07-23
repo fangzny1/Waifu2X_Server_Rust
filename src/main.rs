@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use tokio::fs;
 use tokio::sync::Mutex;
-
+use tower_http::cors::CorsLayer;
 use axum::{
     extract::{Multipart, Path as AxumPath, State},
     http::StatusCode,
@@ -49,6 +49,8 @@ async fn upload(
     State(state): State<AppState>,
     mut multipart: Multipart,
 ) -> Json<Response> {
+    println!("[upload] ====== 收到上传请求 ======");
+
     // 1. 检查存储上限
     let total_size: u64 = WalkDir::new(&state.upload_dir)
         .into_iter()
@@ -57,8 +59,10 @@ async fn upload(
         .filter_map(|e| e.metadata().ok())
         .map(|m| m.len())
         .sum();
+    println!("[upload] 当前存储用量: {} bytes / {} bytes", total_size, state.max_storage);
 
     if total_size > state.max_storage {
+        println!("[upload] 拒绝: 存储已满");
         return Json(Response {
             task_id: String::new(),
             status: "storage_full".into(),
@@ -66,42 +70,83 @@ async fn upload(
     }
 
     // 2. 读上传的文件
-    while let Some(field) = multipart.next_field().await.unwrap() {
-        // 从原始文件名拿后缀 → "photo.jpg" → "jpg"
-        let original_name = field
-            .file_name()
-            .unwrap_or("unknown.jpg")
-            .to_string();
-        let ext = original_name
-            .rsplit('.')
-            .next()
-            .unwrap_or("jpg")
-            .to_string();
+    println!("[upload] 开始解析 multipart 字段...");
+    loop {
+        let field_result = multipart.next_field().await;
+        match field_result {
+            Ok(Some(field)) => {
+                let original_name = field
+                    .file_name()
+                    .unwrap_or("(no filename)")
+                    .to_string();
+                let field_name = field.name().unwrap_or("(no name)").to_string();
+                println!("[upload] 字段名={}, 文件名={}", field_name, original_name);
 
-        let data = field.bytes().await.unwrap();
-        println!("收到: {} ({} bytes)", original_name, data.len());
+                let ext = original_name
+                    .rsplit('.')
+                    .next()
+                    .unwrap_or("jpg")
+                    .to_string();
 
-        // 3. 生成 task_id，文件名 = task_id.后缀
-        let task_id = uuid::Uuid::new_v4().to_string();
-        let filename = format!("{}/{}.{}", state.upload_dir, task_id, ext);
+                match field.bytes().await {
+                    Ok(data) => {
+                        println!("[upload] 收到 {} bytes", data.len());
+                        if data.is_empty() {
+                            println!("[upload] 警告: 文件数据为空!");
+                        }
 
-        fs::write(&filename, &data).await.unwrap();
-        println!("已保存: {}", filename);
+                        let task_id = uuid::Uuid::new_v4().to_string();
+                        let filename = format!("{}/{}.{}", state.upload_dir, task_id, ext);
 
-        // 4. 插入任务表 + 塞队列
-        {
-            let mut tasks = state.tasks.lock().await;
-            tasks.insert(task_id.clone(), TaskStatus::Queued);
+                        match fs::write(&filename, &data).await {
+                            Ok(()) => println!("[upload] 已保存: {}", filename),
+                            Err(e) => {
+                                println!("[upload] 写文件失败: {}", e);
+                                return Json(Response {
+                                    task_id: String::new(),
+                                    status: format!("write_error: {}", e),
+                                });
+                            }
+                        }
+
+                        {
+                            let mut tasks = state.tasks.lock().await;
+                            tasks.insert(task_id.clone(), TaskStatus::Queued);
+                        }
+                        match state.sender.send(task_id.clone()).await {
+                            Ok(()) => println!("[upload] 已入队: {}", task_id),
+                            Err(e) => println!("[upload] 入队失败: {}", e),
+                        }
+
+                        return Json(Response {
+                            task_id,
+                            status: "queued".into(),
+                        });
+                    }
+                    Err(e) => {
+                        println!("[upload] 读字段数据失败: {}", e);
+                        return Json(Response {
+                            task_id: String::new(),
+                            status: format!("read_error: {}", e),
+                        });
+                    }
+                }
+            }
+            Ok(None) => {
+                println!("[upload] multipart 字段结束，没收到文件");
+                break;
+            }
+            Err(e) => {
+                println!("[upload] multipart 解析错误: {}", e);
+                return Json(Response {
+                    task_id: String::new(),
+                    status: format!("multipart_error: {}", e),
+                });
+            }
         }
-        state.sender.send(task_id.clone()).await.unwrap();
-
-        // 5. 秒回
-        return Json(Response {
-            task_id,
-            status: "queued".into(),
-        });
     }
 
+    println!("[upload] 返回 no_file");
     Json(Response {
         task_id: String::new(),
         status: "no_file".into(),
@@ -165,16 +210,21 @@ async fn download(
 
 #[tokio::main]
 async fn main() {
-    fs::create_dir_all("uploads").await.unwrap();
-    fs::create_dir_all("outputs").await.unwrap();
+    // 工作目录下的绝对路径
+    let base_dir = std::env::current_dir().unwrap();
+    let upload_dir = base_dir.join("uploads");
+    let output_dir = base_dir.join("outputs");
+
+    fs::create_dir_all(&upload_dir).await.unwrap();
+    fs::create_dir_all(&output_dir).await.unwrap();
 
     // 创建通道
     let (sender, mut receiver) = tokio::sync::mpsc::channel::<String>(32);
 
     let state = AppState {
         tasks: Arc::new(Mutex::new(HashMap::new())),
-        upload_dir: "uploads".to_string(),
-        output_dir: "outputs".to_string(),
+        upload_dir: upload_dir.display().to_string(),
+        output_dir: output_dir.display().to_string(),
         max_storage: 500 * 1024 * 1024,
         sender,
     };
@@ -265,9 +315,12 @@ async fn main() {
         .route("/upload", post(upload))
         .route("/status/{task_id}", get(get_status))
         .route("/download/{task_id}", get(download))
-        .with_state(state);
+        .with_state(state)
+        .layer(CorsLayer::permissive()) 
+        
+        ;
 
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:5090")
+    let listener = tokio::net::TcpListener::bind("0.0.0.0:5090")
         .await
         .unwrap();
 
