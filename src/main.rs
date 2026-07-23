@@ -9,7 +9,7 @@ use tokio::sync::Mutex;
 use tower_http::cors::CorsLayer;
 use axum::{
     extract::{Multipart, Path as AxumPath, State},
-    http::StatusCode,
+    http::{header, StatusCode},
     routing::{get, post},
     Router,
 };
@@ -150,6 +150,86 @@ async fn upload(
     Json(Response {
         task_id: String::new(),
         status: "no_file".into(),
+    })
+}
+
+// ── POST /upload_raw ──
+//   直接收 raw bytes，用 header 传文件名和后缀
+//   避开 axum multipart 在浏览器端的 multipart/form-data 解析问题
+async fn upload_raw(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+    body: axum::body::Bytes,
+) -> Json<Response> {
+    println!("[upload_raw] ====== 收到 raw 上传 ======");
+
+    // 存储检查
+    let total_size: u64 = WalkDir::new(&state.upload_dir)
+        .into_iter()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_type().is_file())
+        .filter_map(|e| e.metadata().ok())
+        .map(|m| m.len())
+        .sum();
+
+    if total_size > state.max_storage {
+        println!("[upload_raw] 存储已满");
+        return Json(Response {
+            task_id: String::new(),
+            status: "storage_full".into(),
+        });
+    }
+
+    if body.is_empty() {
+        println!("[upload_raw] body 为空");
+        return Json(Response {
+            task_id: String::new(),
+            status: "empty_body".into(),
+        });
+    }
+
+    let ext = headers
+        .get("X-File-Extension")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("png");
+    let original_name = headers
+        .get("X-File-Name")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("unknown.png");
+
+    println!(
+        "[upload_raw] 收到: {} ({} bytes, ext={})",
+        original_name,
+        body.len(),
+        ext
+    );
+
+    let task_id = uuid::Uuid::new_v4().to_string();
+    let filename = format!("{}/{}.{}", state.upload_dir, task_id, ext);
+
+    match fs::write(&filename, &body).await {
+        Ok(()) => println!("[upload_raw] 已保存: {}", filename),
+        Err(e) => {
+            println!("[upload_raw] 写文件失败: {}", e);
+            return Json(Response {
+                task_id: String::new(),
+                status: format!("write_error: {}", e),
+            });
+        }
+    }
+
+    {
+        let mut tasks = state.tasks.lock().await;
+        tasks.insert(task_id.clone(), TaskStatus::Queued);
+    }
+    if let Err(e) = state.sender.send(task_id.clone()).await {
+        println!("[upload_raw] 入队失败: {}", e);
+    }
+
+    println!("[upload_raw] 已入队: {}", task_id);
+    Json(Response {
+        task_id,
+        status: "queued".into(),
     })
 }
 
@@ -313,12 +393,11 @@ async fn main() {
     // HTTP 服务器
     let app: Router = Router::new()
         .route("/upload", post(upload))
+        .route("/upload_raw", post(upload_raw))
         .route("/status/{task_id}", get(get_status))
         .route("/download/{task_id}", get(download))
-        .with_state(state)
-        .layer(CorsLayer::permissive()) 
-        
-        ;
+        .layer(CorsLayer::permissive())
+        .with_state(state);
 
     let listener = tokio::net::TcpListener::bind("0.0.0.0:5090")
         .await
